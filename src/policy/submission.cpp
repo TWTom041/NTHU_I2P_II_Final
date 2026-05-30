@@ -1,8 +1,8 @@
 #include <utility>
 #include "state.hpp"
-#include "minimax.hpp"
+#include "submission.hpp"
 
-int MiniMax::quiescence(
+int Submission::quiescence(
     State *state,
     GameHistory& history,
     int ply,
@@ -77,7 +77,7 @@ int MiniMax::quiescence(
     return alpha;
 }
 
-int MiniMax::eval_ctx(
+int Submission::eval_ctx(
     State *state,
     int depth,
     GameHistory& history,
@@ -165,7 +165,7 @@ int MiniMax::eval_ctx(
     return best_score;
 }
 
-SearchResult MiniMax::search(
+SearchResult Submission::search(
     State *state,
     int depth,
     GameHistory& history,
@@ -230,7 +230,7 @@ SearchResult MiniMax::search(
     return result;
 } 
 
-ParamMap MiniMax::default_params(){
+ParamMap Submission::default_params(){
     return {
         {"UseKPEval", "true"},
         {"UseEvalMobility", "true"},
@@ -238,7 +238,7 @@ ParamMap MiniMax::default_params(){
     };
 }
 
-std::vector<ParamDef> MiniMax::param_defs(){
+std::vector<ParamDef> Submission::param_defs(){
     return {
         {"UseKPEval", ParamDef::CHECK, "true"},
         {"UseEvalMobility", ParamDef::CHECK, "true"},
