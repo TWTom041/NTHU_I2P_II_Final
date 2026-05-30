@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = --std=c++2a -Wall -Wextra -Wpedantic -g -O3 -march=native
+CXXFLAGS = --std=c++2a -Wall -Wextra -Wpedantic -g -O3 -march=native -static
 
 SOURCES_DIR = src
 UNITTEST_DIR = unittest
@@ -23,10 +23,10 @@ $(UNITTEST_DIR)/build:
 	mkdir -p $(UNITTEST_DIR)/build
 
 minichess: | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(MINICHESS_INC) -o $(BUILD_DIR)/minichess-ubgi $(STATE_SOURCE) $(POLICY_SRC) src/ubgi/ubgi.cpp
+	$(CXX) $(CXXFLAGS) $(MINICHESS_INC) -o $(BUILD_DIR)/minichess-ubgi.exe $(STATE_SOURCE) $(POLICY_SRC) src/ubgi/ubgi.cpp
 
 benchmark: | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) $(MINICHESS_INC) -o $(BUILD_DIR)/minichess-benchmark $(STATE_SOURCE) $(POLICY_SRC) src/benchmark.cpp
+	$(CXX) $(CXXFLAGS) $(MINICHESS_INC) -o $(BUILD_DIR)/minichess-benchmark.exe $(STATE_SOURCE) $(POLICY_SRC) src/benchmark.cpp
 
 test: $(TARGET_UNITTEST)
 
