@@ -19,6 +19,7 @@ struct SearchContext {
     uint64_t nodes = 0;
     int seldepth = 0;
     bool stop = false;
+    int64_t movetime_ms = 0;
     ParamMap params;
     std::function<void(const RootUpdate&)> on_root_update;
 

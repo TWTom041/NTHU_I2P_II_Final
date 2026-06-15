@@ -2,8 +2,13 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <unordered_map>
+#include <chrono>
 #include "state.hpp"
 #include "submission.hpp"
+#include <iostream>
+
+static std::chrono::high_resolution_clock::time_point g_start_time;
 
 /* ================================================================
  * Static member definitions
@@ -33,12 +38,10 @@ void Submission::store_tt(uint64_t key, int score, int depth, TTFlag flag, const
     TTEntry& entry = tt[idx];
     uint32_t key32 = (uint32_t)(key >> 32);
 
-    // Adjust mate scores for storage (ply-independent)
     int adj_score = score;
     if(score > P_MAX - 200) adj_score += ply;
     else if(score < M_MAX + 200) adj_score -= ply;
 
-    // Replace if: empty, same position, or we searched deeper
     if(entry.key32 == 0 || entry.key32 == key32 || depth >= entry.depth){
         entry.key32 = key32;
         entry.score = (int16_t)adj_score;
@@ -61,7 +64,6 @@ bool Submission::probe_tt(uint64_t key, int depth, int alpha, int beta, int& sco
 
     if(entry.depth >= depth){
         score = (int)entry.score;
-        // Adjust mate scores for retrieval
         if(score > P_MAX - 200) score -= ply;
         else if(score < M_MAX + 200) score += ply;
 
@@ -70,6 +72,91 @@ bool Submission::probe_tt(uint64_t key, int depth, int alpha, int beta, int& sco
         if(entry.flag == TT_BETA && score >= beta){ score = beta; return true; }
     }
     return false;
+}
+
+/* ================================================================
+ * Custom State Value Function (Evaluation)
+ * ================================================================ */
+
+static const int TUNE_MATERIAL[7] = {0, 20, 60, 70, 80, 200, 1000};
+static const int TUNE_PST[6][6][5] = {
+    // Pawn
+    {{ 0,  0,  0,  0,  0}, {20, 20, 20, 20, 20}, { 5,  8, 12,  8,  5},
+     { 2,  4,  6,  4,  2}, { 0,  2,  2,  2,  0}, { 0,  0,  0,  0,  0}},
+    // Rook
+    {{ 2,  2,  2,  2,  2}, { 4,  4,  4,  4,  4}, { 0,  0,  2,  0,  0},
+     { 0,  0,  2,  0,  0}, { 0,  0,  2,  0,  0}, { 0,  0,  0,  0,  0}},
+    // Knight
+    {{-4, -2,  0, -2, -4}, {-2,  2,  4,  2, -2}, { 0,  4,  6,  4,  0},
+     { 0,  4,  6,  4,  0}, {-2,  2,  4,  2, -2}, {-4, -2,  0, -2, -4}},
+    // Bishop
+    {{-2,  0,  0,  0, -2}, { 0,  3,  4,  3,  0}, { 0,  4,  4,  4,  0},
+     { 0,  4,  4,  4,  0}, { 0,  3,  4,  3,  0}, {-2,  0,  0,  0, -2}},
+    // Queen
+    {{-2,  0,  2,  0, -2}, { 0,  2,  4,  2,  0}, { 0,  4,  6,  4,  0},
+     { 0,  4,  6,  4,  0}, { 0,  2,  4,  2,  0}, {-2,  0,  2,  0, -2}},
+    // King
+    {{-8, -8, -8, -8, -8}, {-4, -4, -4, -4, -4}, {-4, -4, -4, -4, -4},
+     {-4, -4, -4, -4, -4}, { 4,  4,  0,  4,  4}, { 6,  6,  2,  6,  6}},
+};
+
+static const int TUNE_TROPISM_W[7] = {0, 0, 3, 3, 2, 5, 0};
+
+static inline int custom_king_tropism(int piece_type, int pr, int pc, int ekr, int ekc) {
+    int dist = std::max(std::abs(pr - ekr), std::abs(pc - ekc));
+    if(dist <= 2){
+        return TUNE_TROPISM_W[piece_type] * (3 - dist);
+    }
+    return 0;
+}
+
+static int custom_evaluate(State* state) {
+    if (state->game_state == WIN) {
+        return P_MAX;
+    } else if (state->game_state == DRAW) {
+        return 0;
+    }
+
+    auto self_board = state->board.board[state->player];
+    auto oppn_board = state->board.board[1 - state->player];
+    int self_score = 0, oppn_score = 0;
+
+    int self_kr = -1, self_kc = -1;
+    int oppn_kr = -1, oppn_kc = -1;
+
+    for (int r = 0; r < BOARD_H; r++) {
+        for (int c = 0; c < BOARD_W; c++) {
+            if (self_board[r][c] == 6) { self_kr = r; self_kc = c; }
+            if (oppn_board[r][c] == 6) { oppn_kr = r; oppn_kc = c; }
+        }
+    }
+
+    for (int r = 0; r < BOARD_H; r++) {
+        for (int c = 0; c < BOARD_W; c++) {
+            int p_self = self_board[r][c];
+            if (p_self) {
+                int pst_r = (state->player == 0) ? r : BOARD_H - 1 - r;
+                self_score += TUNE_MATERIAL[p_self] + TUNE_PST[p_self - 1][pst_r][c];
+                if (oppn_kr != -1) {
+                    self_score += custom_king_tropism(p_self, r, c, oppn_kr, oppn_kc);
+                }
+            }
+            int p_oppn = oppn_board[r][c];
+            if (p_oppn) {
+                int pst_r = (1 - state->player == 0) ? r : BOARD_H - 1 - r;
+                oppn_score += TUNE_MATERIAL[p_oppn] + TUNE_PST[p_oppn - 1][pst_r][c];
+                if (self_kr != -1) {
+                    oppn_score += custom_king_tropism(p_oppn, r, c, self_kr, self_kc);
+                }
+            }
+        }
+    }
+
+    // Faster mobility heuristic based on legal actions count without full null state generation
+    int self_mobility = state->legal_actions.size();
+    int bonus = self_mobility * 2; // Approximate mobility advantage
+
+    return self_score - oppn_score + bonus;
 }
 
 /* ================================================================
@@ -103,7 +190,6 @@ void Submission::sort_moves(
         auto& m = moves[i];
         int s = 0;
 
-        // TT move gets highest priority
         if(m == tt_move && tt_move.first != tt_move.second){
             s = 1000000;
         } else {
@@ -112,13 +198,11 @@ void Submission::sort_moves(
             int victim = state->board.board[opp][to_r][to_c];
 
             if(victim){
-                // MVV-LVA: prioritize capturing valuable pieces with cheap pieces
                 int from_r = (int)m.first.first;
                 int from_c = (int)m.first.second;
                 int attacker = state->board.board[self][from_r][from_c];
-                s = 100000 + PIECE_VALUES[victim] * 10 - PIECE_VALUES[attacker];
+                s = 100000 + TUNE_MATERIAL[victim] * 10 - TUNE_MATERIAL[attacker];
             } else {
-                // Check killer moves
                 if(ply < MAX_PLY){
                     if(m == killers[ply][0]){
                         s = 90000;
@@ -126,7 +210,6 @@ void Submission::sort_moves(
                         s = 80000;
                     }
                 }
-                // History heuristic
                 int from_sq = move_to_sq(m.first);
                 int to_sq = move_to_sq(m.second);
                 if(from_sq >= 0 && from_sq < 30 && to_sq >= 0 && to_sq < 30){
@@ -134,7 +217,6 @@ void Submission::sort_moves(
                 }
             }
 
-            // Pawn promotion bonus
             int piece = state->board.board[self][(int)m.first.first][(int)m.first.second];
             if(piece == 1 && (to_r == 0 || to_r == BOARD_H - 1)){
                 s += 95000;
@@ -144,7 +226,6 @@ void Submission::sort_moves(
         scored[i] = {m, s};
     }
 
-    // Sort by score descending
     std::sort(scored, scored + n, [](const ScoredMove& a, const ScoredMove& b){
         return a.score > b.score;
     });
@@ -166,10 +247,26 @@ int Submission::quiescence(
     int alpha,
     int beta
 ){
+    (void)p;
     ctx.nodes++;
     if(ply > ctx.seldepth){
         ctx.seldepth = ply;
     }
+
+    // Periodically check if we are approaching the 10-second hard limit (9.5s safety margin)
+    if ((ctx.nodes & 4095) == 0) {
+        auto now = std::chrono::high_resolution_clock::now();
+        int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_start_time).count();
+        if (ctx.movetime_ms > 0) {
+            int64_t margin = std::min((int64_t)500, ctx.movetime_ms / 20);
+            if (ms >= ctx.movetime_ms - margin) {
+                ctx.stop = true;
+            }
+        } else if (ms >= 9500) {
+            ctx.stop = true;
+        }
+    }
+
     if(ctx.stop){
         return 0;
     }
@@ -190,12 +287,11 @@ int Submission::quiescence(
         return rep_score;
     }
 
-    int stand_pat = state->evaluate(p.use_kp_eval, p.use_eval_mobility, &hist);
+    int stand_pat = custom_evaluate(state);
     if(stand_pat >= beta){
         return beta;
     }
 
-    // Delta pruning
     const int DELTA_MARGIN = 250;
     if(stand_pat + DELTA_MARGIN < alpha){
         return alpha;
@@ -209,7 +305,6 @@ int Submission::quiescence(
 
     int opp = 1 - state->player;
 
-    // Build list of captures and promotions, sorted by MVV-LVA
     struct CaptureMove {
         Move move;
         int mvv_score;
@@ -228,9 +323,9 @@ int Submission::quiescence(
             int mvv_lva = 0;
             if(is_capture){
                 int victim = state->board.board[opp][to_r][to_c];
-                mvv_lva = PIECE_VALUES[victim] * 10 - PIECE_VALUES[piece];
+                mvv_lva = TUNE_MATERIAL[victim] * 10 - TUNE_MATERIAL[piece];
             }
-            if(is_promo) mvv_lva += 900;
+            if(is_promo) mvv_lva += 9000;
 
             if(num_captures < 64){
                 captures[num_captures++] = {action, mvv_lva};
@@ -238,7 +333,6 @@ int Submission::quiescence(
         }
     }
 
-    // Sort captures by MVV-LVA descending
     std::sort(captures, captures + num_captures, [](const CaptureMove& a, const CaptureMove& b){
         return a.mvv_score > b.mvv_score;
     });
@@ -278,22 +372,36 @@ int Submission::eval_ctx(
     SearchContext& ctx,
     const MMParams& p,
     int alpha,
-    int beta
+    int beta,
+    bool null_move_made
 ){
     ctx.nodes++;
     if(ply > ctx.seldepth){
         ctx.seldepth = ply;
     }
+
+    // Periodically check if we are approaching the 10-second hard limit (9.5s safety margin)
+    if ((ctx.nodes & 4095) == 0) {
+        auto now = std::chrono::high_resolution_clock::now();
+        int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_start_time).count();
+        if (ctx.movetime_ms > 0) {
+            int64_t margin = std::min((int64_t)500, ctx.movetime_ms / 20);
+            if (ms >= ctx.movetime_ms - margin) {
+                ctx.stop = true;
+            }
+        } else if (ms >= 9500) {
+            ctx.stop = true;
+        }
+    }
+
     if(ctx.stop){
         return 0;
     }
 
-    /* === Lazy move generation (sets game_state) === */
     if(state->legal_actions.empty() && state->game_state == UNKNOWN){
         state->get_legal_actions();
     }
 
-    /* === Terminal / leaf checks === */
     if(state->game_state == WIN){
         return P_MAX - ply;
     }
@@ -301,7 +409,6 @@ int Submission::eval_ctx(
         return 0;
     }
 
-    /* === Repetition check === */
     int rep_score;
     if(state->check_repetition(hist, rep_score)){
         return rep_score;
@@ -310,7 +417,6 @@ int Submission::eval_ctx(
     bool is_pv = (beta - alpha > 1);
     int orig_alpha = alpha;
 
-    /* === Transposition Table Probe === */
     uint64_t hash_key = state->hash();
     Move tt_move = {};
     int tt_score;
@@ -328,15 +434,14 @@ int Submission::eval_ctx(
         return score;
     }
 
-    /* === Null-Move Pruning === */
-    if(!is_pv && depth >= 3 && ply > 0){
-        int static_eval = state->evaluate(p.use_kp_eval, false, &hist);
+    if(!is_pv && depth >= 3 && ply > 0 && !null_move_made){
+        int static_eval = custom_evaluate(state);
         if(static_eval >= beta){
             BaseState* null_state = state->create_null_state();
             if(null_state){
                 State* ns = static_cast<State*>(null_state);
                 int R = 2 + (depth >= 6 ? 1 : 0);
-                int null_score = -eval_ctx(ns, depth - 1 - R, hist, ply + 1, ctx, p, -beta, -beta + 1);
+                int null_score = -eval_ctx(ns, depth - 1 - R, hist, ply + 1, ctx, p, -beta, -beta + 1, true);
                 delete ns;
 
                 if(null_score >= beta){
@@ -347,20 +452,17 @@ int Submission::eval_ctx(
         }
     }
 
-    /* === Reverse Futility Pruning === */
     if(!is_pv && depth <= 3 && ply > 0){
-        int static_eval = state->evaluate(p.use_kp_eval, false, &hist);
-        int margin = 120 * depth;
+        int static_eval = custom_evaluate(state);
+        int margin = 200 * depth;
         if(static_eval - margin >= beta){
             hist.pop(hash_key);
             return static_eval - margin;
         }
     }
 
-    /* === Move Ordering === */
     sort_moves(state, state->legal_actions, tt_move, ply);
 
-    /* === PVS loop === */
     int best_score = M_MAX;
     Move best_move = {};
     int move_index = 0;
@@ -370,7 +472,6 @@ int Submission::eval_ctx(
         bool same = next->same_player_as_parent();
         int score;
 
-        // Determine move characteristics for LMR
         int to_r = (int)action.second.first;
         int to_c = (int)action.second.second;
         int opp = 1 - state->player;
@@ -380,11 +481,9 @@ int Submission::eval_ctx(
         bool is_killer = (ply < MAX_PLY && (action == killers[ply][0] || action == killers[ply][1]));
 
         if(move_index == 0){
-            // First move: full window search
             score = eval_ctx(next, depth - 1, hist, ply + 1, ctx, p, same ? alpha : -beta, same ? beta : -alpha);
             if(!same) score = -score;
         }else{
-            /* === Late Move Reductions (LMR) === */
             int reduction = 0;
             if(depth >= 3 && move_index >= 3 && !is_capture && !is_promo && !is_killer && !is_pv){
                 reduction = 1;
@@ -392,17 +491,14 @@ int Submission::eval_ctx(
                 if(depth - 1 - reduction < 1) reduction = std::max(0, depth - 2);
             }
 
-            // Null window search (with possible LMR)
             score = eval_ctx(next, depth - 1 - reduction, hist, ply + 1, ctx, p, same ? alpha : -alpha - 1, same ? alpha + 1 : -alpha);
             if(!same) score = -score;
 
-            // Re-search at full depth if LMR was applied and score is promising
             if(reduction > 0 && score > alpha){
                 score = eval_ctx(next, depth - 1, hist, ply + 1, ctx, p, same ? alpha : -alpha - 1, same ? alpha + 1 : -alpha);
                 if(!same) score = -score;
             }
 
-            // Full-window re-search if null window failed high
             if(score > alpha && score < beta){
                 score = eval_ctx(next, depth - 1, hist, ply + 1, ctx, p, same ? alpha : -beta, same ? beta : -alpha);
                 if(!same) score = -score;
@@ -424,7 +520,6 @@ int Submission::eval_ctx(
             alpha = score;
         }
         if(alpha >= beta){
-            // Beta cutoff: update killer moves and history for quiet moves
             if(!is_capture){
                 if(ply < MAX_PLY){
                     if(killers[ply][0] != action){
@@ -453,12 +548,11 @@ int Submission::eval_ctx(
         move_index++;
     }
 
-    /* === Store in TT === */
     TTFlag flag;
     if(best_score <= orig_alpha){
-        flag = TT_ALPHA;  // fail-low: upper bound
+        flag = TT_ALPHA;
     } else if(best_score >= beta){
-        flag = TT_BETA;   // fail-high: lower bound
+        flag = TT_BETA;
     } else {
         flag = TT_EXACT;
     }
@@ -483,72 +577,97 @@ SearchResult Submission::search(
     SearchResult result;
     result.depth = depth;
 
-    // Clear killers at start of each depth (but keep TT and history)
+    if (depth == 1) {
+        g_start_time = std::chrono::high_resolution_clock::now();
+    }
+
     std::memset(killers, 0, sizeof(killers));
 
     if(!state->legal_actions.size()){
         state->get_legal_actions();
     }
 
-    /* === Probe TT for best move from previous iteration === */
     uint64_t root_hash = state->hash();
     Move tt_move = {};
     int tt_score;
-    probe_tt(root_hash, 0, M_MAX, P_MAX, tt_score, tt_move, 0);
+    bool tt_hit = probe_tt(root_hash, 0, M_MAX, P_MAX, tt_score, tt_move, 0);
 
-    /* === Move ordering at root === */
     sort_moves(state, state->legal_actions, tt_move, 0);
 
-    int best_score = M_MAX - 10;
     int alpha = M_MAX;
     int beta = P_MAX;
-    int move_index = 0;
-    int total_moves = (int)state->legal_actions.size();
+    int best_score = M_MAX - 10;
     Move best_move = {};
+    int total_moves = (int)state->legal_actions.size();
+    
+    // Aspiration Windows
+    if (depth >= 4 && tt_hit) {
+        alpha = std::max(M_MAX, tt_score - 50);
+        beta = std::min(P_MAX, tt_score + 50);
+    }
 
-    for(auto& action : state->legal_actions){
-        State* next = state->next_state(action);
-        bool same = next->same_player_as_parent();
-        int score;
+    while (true) {
+        int orig_alpha = alpha;
+        int orig_beta = beta;
+        best_score = M_MAX - 10;
+        int move_index = 0;
+        
+        for(auto& action : state->legal_actions){
+            State* next = state->next_state(action);
+            bool same = next->same_player_as_parent();
+            int score;
 
-        if(move_index == 0){
-            score = eval_ctx(next, depth - 1, hist, 1, ctx, p, same ? alpha : -beta, same ? beta : -alpha);
-            if(!same) score = -score;
-        }else{
-            // Null window
-            score = eval_ctx(next, depth - 1, hist, 1, ctx, p, same ? alpha : -alpha - 1, same ? alpha + 1 : -alpha);
-            if(!same) score = -score;
-
-            if(score > alpha && score < beta){
+            if(move_index == 0){
                 score = eval_ctx(next, depth - 1, hist, 1, ctx, p, same ? alpha : -beta, same ? beta : -alpha);
                 if(!same) score = -score;
+            }else{
+                score = eval_ctx(next, depth - 1, hist, 1, ctx, p, same ? alpha : -alpha - 1, same ? alpha + 1 : -alpha);
+                if(!same) score = -score;
+
+                if(score > alpha && score < beta){
+                    score = eval_ctx(next, depth - 1, hist, 1, ctx, p, same ? alpha : -beta, same ? beta : -alpha);
+                    if(!same) score = -score;
+                }
             }
+
+            delete next;
+
+            if(ctx.stop && depth > 1){
+                break;
+            }
+
+            if(score > best_score){
+                best_score = score;
+                best_move = action;
+                result.best_move = action;
+                result.score = best_score;
+
+                if(p.report_partial && ctx.on_root_update){
+                    ctx.on_root_update({result.best_move, best_score, depth, move_index + 1, total_moves});
+                }
+            }
+            if(score > alpha){
+                alpha = score;
+            }
+
+            move_index++;
         }
 
-        delete next;
-
-        if(ctx.stop && depth > 1){
+        if (ctx.stop && depth > 1) {
             break;
         }
 
-        if(score > best_score){
-            best_score = score;
-            best_move = action;
-            result.best_move = action;
-            result.score = best_score;
-
-            if(p.report_partial && ctx.on_root_update){
-                ctx.on_root_update({result.best_move, best_score, depth, move_index + 1, total_moves});
-            }
+        // Check if aspiration window failed
+        if (best_score <= orig_alpha && orig_alpha > M_MAX) {
+            alpha = M_MAX;
+            continue; // Re-search with full lower bound
+        } else if (best_score >= orig_beta && orig_beta < P_MAX) {
+            beta = P_MAX;
+            continue; // Re-search with full upper bound
         }
-        if(score > alpha){
-            alpha = score;
-        }
-
-        move_index++;
+        break;
     }
 
-    // Store root result in TT
     if(!ctx.stop || depth == 1){
         store_tt(root_hash, best_score, depth, TT_EXACT, best_move, 0);
     }
@@ -563,7 +682,7 @@ ParamMap Submission::default_params(){
     return {
         {"UseKPEval", "true"},
         {"UseEvalMobility", "true"},
-        {"ReportPartial", "true"},
+        {"ReportPartial", "false"},
     };
 }
 
@@ -571,6 +690,6 @@ std::vector<ParamDef> Submission::param_defs(){
     return {
         {"UseKPEval", ParamDef::CHECK, "true"},
         {"UseEvalMobility", ParamDef::CHECK, "true"},
-        {"ReportPartial", ParamDef::CHECK, "true"},
+        {"ReportPartial", ParamDef::CHECK, "false"},
     };
 }

@@ -278,14 +278,15 @@ static void do_search(
     state.step = step;
     state.get_legal_actions();
 
+    g_searching = true;
+
+    // Removed timer thread since engines must manage their own timeouts
+
     auto alive = [&](){
         if(my_gen != g_search_gen.load()){
             return false;
         }
-        if(g_ctx.stop){
-            ctx.stop = true;
-        }
-        return !ctx.stop;
+        return !g_ctx.stop;
     };
 
     if(state.legal_actions.empty()){
@@ -309,6 +310,7 @@ static void do_search(
     g_best_move = best_move;
     int depth_limit = (max_depth > 0) ? max_depth : 100;
     uint64_t total_nodes = 0;
+    ctx.movetime_ms = movetime_ms;
 
     auto search_start = std::chrono::high_resolution_clock::now();
 
