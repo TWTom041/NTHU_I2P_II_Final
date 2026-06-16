@@ -114,7 +114,7 @@ static int custom_evaluate(State* state) {
     if (state->game_state == WIN) {
         return P_MAX;
     } else if (state->game_state == DRAW) {
-        return 0;
+        return -20; // Contempt factor
     }
 
     auto self_board = state->board.board[state->player];
@@ -406,12 +406,12 @@ int Submission::eval_ctx(
         return P_MAX - ply;
     }
     if(state->game_state == DRAW){
-        return 0;
+        return -20; // Contempt factor
     }
 
     int rep_score;
     if(state->check_repetition(hist, rep_score)){
-        return rep_score;
+        return -20; // Contempt factor to avoid repeating moves in even positions
     }
 
     bool is_pv = (beta - alpha > 1);
