@@ -36,11 +36,10 @@ struct CompactMove {
 
 struct TTEntry {
     uint32_t key32;      // Upper 32 bits of Zobrist hash for verification
-    int16_t  score;      // search score
+    int32_t  score;      // search score
     int8_t   depth;      // search depth
     TTFlag   flag;       // bound type
     CompactMove best_move; // best move found (2 bytes)
-    // Total: 4 + 2 + 1 + 1 + 2 = 10 bytes, padded to 12
 };
 
 // 2M entries × 12 bytes ≈ 24MB — well within memory budget
@@ -96,7 +95,8 @@ public:
         SearchContext& ctx,
         const MMParams& p,
         int alpha = M_MAX,
-        int beta = P_MAX
+        int beta = P_MAX,
+        bool null_move_made = false
     );
     static SearchResult search(
         State *state,

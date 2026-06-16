@@ -44,7 +44,7 @@ void Submission::store_tt(uint64_t key, int score, int depth, TTFlag flag, const
 
     if(entry.key32 == 0 || entry.key32 == key32 || depth >= entry.depth){
         entry.key32 = key32;
-        entry.score = (int16_t)adj_score;
+        entry.score = adj_score;
         entry.depth = (int8_t)depth;
         entry.flag = flag;
         entry.best_move = CompactMove(best_move);
@@ -114,7 +114,7 @@ static int custom_evaluate(State* state) {
     if (state->game_state == WIN) {
         return P_MAX;
     } else if (state->game_state == DRAW) {
-        return -20; // Contempt factor
+        return 0;
     }
 
     auto self_board = state->board.board[state->player];
@@ -406,12 +406,12 @@ int Submission::eval_ctx(
         return P_MAX - ply;
     }
     if(state->game_state == DRAW){
-        return -20; // Contempt factor
+        return 0;
     }
 
     int rep_score;
     if(state->check_repetition(hist, rep_score)){
-        return -20; // Contempt factor to avoid repeating moves in even positions
+        return rep_score;
     }
 
     bool is_pv = (beta - alpha > 1);
