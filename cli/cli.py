@@ -439,18 +439,29 @@ def run_game(
     params: list[str] | None = None,
     white_params: list[str] | None = None,
     black_params: list[str] | None = None,
+    opening_moves: list[str] | None = None,
 ) -> str:
     """Run a single game between two players.
 
     Returns "white", "black", or "draw".
     params: shared params for both sides.
     white_params/black_params: per-side overrides (merged after shared).
+    opening_moves: forced opening sequence (UCI) replayed before play starts.
     """
     game_name = _game_ctx.get("name", "generic")
     has_state = game_name != "generic"
     uci_moves: list[str] = []
     move_number = 0
     state = _init_game_state(game_name)
+
+    # Replay a forced opening so a match samples diverse positions.
+    if opening_moves and has_state:
+        apply_fn = _game_ctx.get("apply_move")
+        for omv in opening_moves:
+            uci_moves.append(omv)
+            if apply_fn is not None:
+                state, _ = apply_fn(state, omv, _game_ctx)
+        move_number = (len(opening_moves) + 1) // 2
 
     if verbose:
         if game_num is not None and total_games is not None:
@@ -542,6 +553,29 @@ def run_game(
             print_board(state)
 
 
+def _generate_random_opening(game_name: str, plies: int, rng) -> list[str]:
+    """Play `plies` random legal moves from the start position; return them
+    as a UCI list. Stops early if the game ends."""
+    if plies <= 0 or game_name == "generic":
+        return []
+    state = _init_game_state(game_name)
+    apply_fn = _game_ctx.get("apply_move")
+    move_to_uci = _game_ctx.get("move_to_uci")
+    out: list[str] = []
+    for _ in range(plies):
+        moves = getattr(state, "legal_actions", None)
+        if not moves:
+            break
+        mv = rng.choice(list(moves))
+        uci = move_to_uci(mv) if move_to_uci else None
+        if not uci:
+            break
+        out.append(uci)
+        if apply_fn is not None:
+            state, _ = apply_fn(state, uci, _game_ctx)
+    return out
+
+
 def run_tournament(
     engine1_path: str,
     engine2_path: str,
@@ -554,8 +588,11 @@ def run_tournament(
     params: list[str] | None = None,
     engine1_params: list[str] | None = None,
     engine2_params: list[str] | None = None,
+    opening_plies: int = 0,
+    seed: int = 0,
 ) -> None:
     """Run a tournament of N games, alternating colors."""
+    import random as _random
     engine1_wins = 0
     engine2_wins = 0
     draws = 0
@@ -593,6 +630,13 @@ def run_tournament(
             else:
                 w_params, b_params = engine2_params, engine1_params
 
+            # Same opening for each color-swapped pair of games (fairness).
+            opening_moves = _generate_random_opening(
+                _game_ctx.get("name", "generic"),
+                opening_plies,
+                _random.Random(seed + game_idx // 2),
+            )
+
             result = run_game(
                 w_path,
                 b_path,
@@ -606,6 +650,7 @@ def run_tournament(
                 params=params,
                 white_params=w_params,
                 black_params=b_params,
+                opening_moves=opening_moves,
             )
 
             match result:
@@ -727,6 +772,15 @@ def main() -> None:
         default=[],
         help="Set engine param for black only: --black-param UseEvalMobility=false",
     )
+    parser.add_argument(
+        "--opening-plies",
+        type=int,
+        default=0,
+        help="Random opening plies per game for position diversity (default: 0).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0, help="RNG seed for random openings (default: 0)."
+    )
     args = parser.parse_args()
 
     _init_game(args.game.lower())
@@ -767,6 +821,8 @@ def main() -> None:
             params=args.param,
             engine1_params=wp,
             engine2_params=bp,
+            opening_plies=args.opening_plies,
+            seed=args.seed,
         )
         return
 
