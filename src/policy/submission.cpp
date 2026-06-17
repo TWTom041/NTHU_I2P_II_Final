@@ -36,6 +36,38 @@ Move Submission::counter_moves[2][30][30];
 std::chrono::high_resolution_clock::time_point Submission::search_start_time;
 int64_t Submission::search_time_limit_ms = 0;
 
+/* ================================================================
+ * Search node pool: a ply-indexed array of State objects reused across the
+ * (single-threaded, depth-first) search instead of heap-allocating a child
+ * State at every node. Because search is DFS, pool[child_ply] is free to
+ * overwrite once a child's subtree returns, and a parent never reads a child
+ * slot while recursing into it -- so this also removes the per-node move-list
+ * allocation (each slot's legal_actions buffer is reused). Falls back to the
+ * heap path beyond the pool depth (never hit in practice).
+ * ================================================================ */
+static const int NODE_POOL_SIZE = 256;
+static State g_node_pool[NODE_POOL_SIZE];
+
+static inline State* child_state(State* parent, const Move& action, int child_ply, bool& heap){
+    if(child_ply < NODE_POOL_SIZE){
+        heap = false;
+        parent->apply_into(g_node_pool[child_ply], action);
+        return &g_node_pool[child_ply];
+    }
+    heap = true;
+    return static_cast<State*>(parent->next_state(action));
+}
+
+static inline State* null_child(State* parent, int child_ply, bool& heap){
+    if(child_ply < NODE_POOL_SIZE){
+        heap = false;
+        parent->null_into(g_node_pool[child_ply]);
+        return &g_node_pool[child_ply];
+    }
+    heap = true;
+    return static_cast<State*>(parent->create_null_state());
+}
+
 void Submission::init_tt(){
     if(!tt_initialized){
         tt = new TTEntry[TT_SIZE]();  // value-initialize (zero)
@@ -596,13 +628,14 @@ int Submission::quiescence(
     for(int i = 0; i < num_captures; i++){
         auto& action = captures[i].move;
 
-        State* next = state->next_state(action);
+        bool heap;
+        State* next = child_state(state, action, ply + 1, heap);
         bool same = next->same_player_as_parent();
 
         int score = quiescence(next, hist, ply + 1, ctx, p, same ? alpha : -beta, same ? beta : -alpha);
         if(!same) score = -score;
 
-        delete next;
+        if(heap) delete next;
 
         if(ctx.stop){
             hist.pop(state->hash());
@@ -724,13 +757,13 @@ int Submission::eval_ctx(
     // Null Move Pruning
     if(!is_pv && null_move_allowed && depth >= 3 && ply > 0 && !in_check){
         if(static_eval >= beta){
-            BaseState* null_state = state->create_null_state();
-            if(null_state){
-                State* ns = static_cast<State*>(null_state);
+            bool null_heap;
+            State* ns = null_child(state, ply + 1, null_heap);
+            if(ns){
                 int R = std::min(depth - 1, 3 + (depth >= 7 ? 1 : 0));
                 if(R < 2) R = 2;
                 int null_score = -eval_ctx(ns, depth - 1 - R, hist, ply + 1, ctx, p, -beta, -beta + 1, false);
-                delete ns;
+                if(null_heap) delete ns;
 
                 if(null_score >= beta){
                     hist.pop(hash_key);
@@ -775,7 +808,8 @@ int Submission::eval_ctx(
             continue;
         }
 
-        State* next = state->next_state(action);
+        bool heap;
+        State* next = child_state(state, action, ply + 1, heap);
         bool same = next->same_player_as_parent();
         int score;
 
@@ -818,7 +852,7 @@ int Submission::eval_ctx(
             }
         }
 
-        delete next;
+        if(heap) delete next;
 
         if(ctx.stop){
             hist.pop(hash_key);
@@ -944,7 +978,8 @@ SearchResult Submission::search(
         Move iter_best_move = best_move;
         
         for(auto& action : state->legal_actions){
-            State* next = state->next_state(action);
+            bool heap;
+            State* next = child_state(state, action, 1, heap);
             bool same = next->same_player_as_parent();
             int score;
 
@@ -962,7 +997,7 @@ SearchResult Submission::search(
                 }
             }
 
-            delete next;
+            if(heap) delete next;
 
             if(ctx.stop && depth > 1){
                 break;

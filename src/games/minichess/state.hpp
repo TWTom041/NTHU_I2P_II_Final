@@ -50,6 +50,11 @@ public:
         const GameHistory* history = nullptr
     ) override;
     State* next_state(const Move& move) override;
+    /* In-place equivalents of next_state / create_null_state that write into a
+     * caller-owned State (a search pool slot), avoiding per-node heap alloc.
+     * dst's legal_actions buffer is reused (cleared, capacity kept). */
+    void apply_into(State& dst, const Move& move) const;
+    void null_into(State& dst) const;
     void get_legal_actions() override;
     void get_legal_actions_naive();
     void get_legal_actions_bitboard();

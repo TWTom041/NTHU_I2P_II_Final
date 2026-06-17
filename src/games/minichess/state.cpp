@@ -258,6 +258,56 @@ State* State::next_state(const Move& move){
     return ns;
 }
 
+/* Same transition as next_state, but written into a caller-owned `dst`
+ * (a search pool slot) so the search avoids a heap allocation + free per node.
+ * dst.legal_actions is cleared (capacity retained) and left for lazy
+ * regeneration by the search; game_state is reset to UNKNOWN. */
+void State::apply_into(State& dst, const Move& move) const {
+    if(!zobrist_ready){ init_zobrist(); }
+
+    dst.board = this->board;
+    Point from = move.first, to = move.second;
+    int p = this->player;
+    int opp = 1 - p;
+
+    int8_t orig_piece = dst.board.board[p][from.first][from.second];
+    int8_t moved = orig_piece;
+    if(moved == 1 && (to.first == BOARD_H - 1 || to.first == 0)){
+        moved = 5;
+    }
+
+    uint64_t h = this->hash();
+    h ^= zobrist_side;
+    h ^= zobrist_piece[p][orig_piece][from.first][from.second];
+
+    int8_t captured = dst.board.board[opp][to.first][to.second];
+    if(captured){
+        h ^= zobrist_piece[opp][captured][to.first][to.second];
+        dst.board.board[opp][to.first][to.second] = 0;
+    }
+    h ^= zobrist_piece[p][moved][to.first][to.second];
+
+    dst.board.board[p][from.first][from.second] = 0;
+    dst.board.board[p][to.first][to.second] = moved;
+
+    dst.player = opp;
+    dst.zobrist_hash = h;
+    dst.zobrist_valid = true;
+    dst.game_state = UNKNOWN;
+    dst.legal_actions.clear();
+}
+
+/* Null move (pass): same board, side flipped, into a caller-owned dst. */
+void State::null_into(State& dst) const {
+    if(!zobrist_ready){ init_zobrist(); }
+    dst.board = this->board;
+    dst.player = 1 - this->player;
+    dst.zobrist_hash = this->hash() ^ zobrist_side;
+    dst.zobrist_valid = true;
+    dst.game_state = UNKNOWN;
+    dst.legal_actions.clear();
+}
+
 
 static const int move_table_rook_bishop[8][7][2] = {
   {{0, 1}, {0, 2}, {0, 3}, {0, 4}, {0, 5}, {0, 6}, {0, 7}},
