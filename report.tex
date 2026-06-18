@@ -1,0 +1,436 @@
+\documentclass[11pt]{article}
+
+% ------------------------------------------------------------------
+% MiniChess AI -- Mini Project 2 report
+% Compile: pdflatex report.tex  (uses only standard packages)
+% ------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\definecolor{kw}{rgb}{0.0,0.0,0.6}
+\definecolor{cmt}{rgb}{0.0,0.45,0.0}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible,
+  showstringspaces=false,
+  language=C++,
+  numbers=none,
+}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\textbf{MiniChess AI -- Design, Search, and a Neural-Network Evaluation Study}\\
+\large Mini Project 2}
+\author{Student ID: \texttt{114000110}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report documents a strong AI for the 6$\times$5 ``MiniChess'' variant. The
+engine combines a classical alpha-beta / Principal Variation Search (PVS) with a
+full modern search stack (transposition table, killer/counter/history move
+ordering, iterative deepening, aspiration windows, null-move pruning, late-move
+reductions, futility pruning, quiescence search) and a \emph{hybrid evaluation}
+that blends a hand-crafted heuristic with a small \emph{NNUE} (Efficiently
+Updatable Neural Network) trained from scratch on self-play data. Beyond the
+working engine, the report presents an empirical study: porting Stockfish's NNUE
+architecture ideas (SFNNv1--v14) to MiniChess, int16 quantization, texel tuning,
+and a search-allocation optimization. The central, repeatedly-confirmed finding
+is that \textbf{on a tiny board, search depth dominates evaluation
+sophistication}, and that \textbf{training-loss improvements do not imply
+playing-strength improvements}. The final engine beats every provided baseline
+(weak/strong minimax, alpha-beta, PVS) with both colours and the visible boss.
+\end{abstract}
+
+\tableofcontents
+
+% ==================================================================
+\section{Overview and architecture}
+% ==================================================================
+The program speaks \textbf{UBGI} (a UCI-superset protocol) over stdin/stdout.
+The code is split into game-agnostic and game-specific layers:
+
+\begin{itemize}[nosep]
+  \item \code{src/ubgi/ubgi.cpp} -- protocol loop and the \emph{iterative
+        deepening} driver (calls the search at depth $1,2,3,\dots$, honours
+        \code{go movetime}, emits \code{info}/\code{bestmove}).
+  \item \code{src/games/minichess/state.cpp} -- board representation, move
+        generation (naive + bitboard), Zobrist hashing, terminal detection.
+  \item \code{src/policy/submission.cpp} -- the engine we developed: PVS search,
+        all pruning/ordering heuristics, the hand-crafted evaluation, and the
+        NNUE blend.
+  \item \code{src/policy/nnue.hpp}, \code{nnue\_weights.hpp} -- the neural
+        evaluator and its embedded weights.
+  \item \code{tools/nnue\_train.cpp} -- a self-contained C++ self-play data
+        generator and trainer (no external ML dependencies).
+\end{itemize}
+
+\paragraph{Rules and representation.} MiniChess is chess on a 6-row $\times$
+5-column board with a \emph{king-capture} win model: a side wins the instant it
+can capture the enemy king. There is no castling and pawns only promote to a
+queen. The board is stored as \code{char board[2][6][5]} (one plane per player;
+values $1{=}\text{P},2{=}\text{R},3{=}\text{N},4{=}\text{B},5{=}\text{Q},6{=}\text{K}$).
+Draws occur by repetition and a step cap. A useful symmetry: Black's starting
+array is exactly White's rotated $180^\circ$, which the NNUE exploits
+(Section~\ref{sec:nnue}).
+
+% ==================================================================
+\section{State value function (evaluation)}
+% ==================================================================
+The evaluation returns an integer score in centipawn-like units \emph{from the
+side-to-move's perspective} (so the search is a pure negamax). The final score
+is a \textbf{blend} of a hand-crafted term and a neural term.
+
+\subsection{Hand-crafted evaluation}
+\code{custom\_evaluate()} computes, for each side,
+\begin{equation}
+S_{\text{hand}} = \big(\text{material} + \text{PST} + \text{king tropism}\big)_{\text{self}}
+  - (\cdots)_{\text{opp}} + \text{pawn terms} + w_m\cdot\text{mobility},
+\end{equation}
+with the following components:
+\begin{itemize}[nosep]
+  \item \textbf{Material}: $\{P,R,N,B,Q,K\}=\{100,500,320,330,900,10000\}$.
+  \item \textbf{Piece-square tables (PST)}: a per-piece $6\times5$ table adding
+        positional value; the table is read from the side-to-move's orientation.
+  \item \textbf{King tropism}: a bonus for own pieces being close to the enemy
+        king (encourages attacking the king, which directly ends the game).
+  \item \textbf{Pawn structure}: penalties for doubled and isolated pawns.
+  \item \textbf{Passed pawns}: a bonus scaling with proximity to promotion
+        (max near the promotion rank), added because promotion is decisive.
+  \item \textbf{Mobility}: $w_m=5$ times the number of legal moves available to
+        the side to move.
+\end{itemize}
+Terminal positions short-circuit: a win returns $P_{\max}$, a draw returns $0$.
+
+\subsection{NNUE evaluation}\label{sec:nnueeval}
+A small neural network (Section~\ref{sec:nnue}) produces a score from the same
+side-to-move perspective. It is blended with the hand-crafted score:
+\begin{equation}
+S = \frac{b\cdot S_{\text{nnue}} + (100-b)\cdot S_{\text{hand}}}{100},
+\qquad b = \texttt{NNUE\_BLEND} = 30.
+\end{equation}
+NNUE is on by default and self-contained; \code{-DNO\_NNUE} disables it and
+\code{-DNNUE\_BLEND=$n$} overrides the mix. \textbf{Why a blend, and why only
+30\%?} Empirically (Section~\ref{sec:blend}) pure NNUE is \emph{weaker} than the
+hand-crafted eval on this game, but a light 30\% admixture is meaningfully
+stronger than either component alone: the net captures outcome-correlated
+patterns the heuristic misses, while the heuristic supplies tactical robustness
+and is cheap to compute.
+
+% ==================================================================
+\section{Tree search}
+% ==================================================================
+\subsection{From minimax to negamax}
+Minimax assumes the opponent minimises our score. Because MiniChess strictly
+alternates turns and the evaluation is symmetric (side-to-move relative), we use
+the \emph{negamax} form: $\text{value}(n) = \max_{m}\,-\,\text{value}(\text{child}(n,m))$.
+
+\begin{lstlisting}[language=C++,caption={Negamax with alpha-beta (concept)}]
+int negamax(node, depth, alpha, beta):
+    if depth == 0 or terminal: return evaluate(node)   // (-> quiescence)
+    for each move m:
+        score = -negamax(child(m), depth-1, -beta, -alpha)
+        if score >= beta: return beta          // beta cutoff (fail-high)
+        if score > alpha: alpha = score
+    return alpha
+\end{lstlisting}
+
+\subsection{Alpha-beta pruning}
+$\alpha$ is the best score the side to move is already assured of; $\beta$ is the
+best the opponent is assured of. When $\alpha \ge \beta$ the remaining moves at a
+node cannot affect the result (the opponent would avoid this line), so the
+branch is pruned. Alpha-beta returns the \emph{same} value as minimax but visits
+far fewer nodes; with good move ordering it approaches the theoretical
+$O(b^{d/2})$ instead of $O(b^d)$.
+
+\subsection{Principal Variation Search (PVS)}
+PVS assumes the first (best-ordered) move is best: it searches that move with a
+full window $[\alpha,\beta]$ and every later move with a \emph{null window}
+$[\alpha,\alpha{+}1]$ (a cheap test of ``is this move worse than the best so
+far?''). If a null-window search unexpectedly fails high, it is re-searched with
+the full window. This is implemented in both \code{minimax.cpp} (the reference)
+and \code{submission.cpp} (the tuned engine).
+
+\subsection{Quiescence search}
+At depth 0 the engine does not evaluate immediately; it runs a
+\emph{quiescence} search over ``noisy'' moves (captures and promotions) until the
+position is quiet, preventing the \emph{horizon effect} (mis-evaluating a
+position in the middle of a capture sequence). It uses a stand-pat cutoff, MVV-LVA
+ordering, and \emph{delta pruning} (skip captures that cannot raise $\alpha$ even
+with a generous margin).
+
+\subsection{Transposition table (TT)}
+A $2^{22}\approx4{\cdot}10^6$-entry hash table caches search results keyed by the
+Zobrist hash. Each \code{TTEntry} ($\approx$10\,bytes) stores a 32-bit key check,
+score, depth, a bound flag (exact / lower / upper), a 16-bit packed best move
+(\code{CompactMove}), and a generation byte for ageing. The TT (i)~returns a
+cached score when a position is reached again at sufficient depth and (ii)~feeds
+the \emph{TT move} to move ordering, which is the single biggest ordering win.
+Mate scores are stored ply-adjusted so they remain correct across transpositions.
+
+\subsection{Move ordering}
+Good ordering makes alpha-beta/PVS effective. Moves are tried in this priority:
+\begin{enumerate}[nosep]
+  \item \textbf{TT move} (the best move found previously at this position).
+  \item \textbf{Captures} by \textbf{MVV-LVA} (Most Valuable Victim $-$ Least
+        Valuable Attacker: $16\cdot V_{\text{victim}} - V_{\text{attacker}}$).
+  \item \textbf{Promotions}.
+  \item \textbf{Killer moves}: two quiet moves per ply that caused a cutoff.
+  \item \textbf{Counter move}: the quiet move that previously refuted the
+        opponent's last move.
+  \item \textbf{History heuristic}: quiet moves scored by how often they have
+        caused cutoffs (indexed by from/to square).
+\end{enumerate}
+
+\subsection{Selectivity: pruning, reductions, extensions}
+On top of plain alpha-beta the engine searches \emph{selectively}:
+\begin{itemize}[nosep]
+  \item \textbf{Null-move pruning (NMP)}: give the opponent a free move; if the
+        position is still $\ge\beta$ at reduced depth ($R=\min(d{-}1,\,3{+}[d\!\ge\!7])$,
+        clamped $\ge2$), prune. Disabled in check and at PV nodes.
+  \item \textbf{Late-move reductions (LMR)}: late, quiet, non-killer moves are
+        searched at reduced depth (reduction $1$--$4$ growing with move index and
+        depth, less at PV nodes); if a reduced search beats $\alpha$ it is
+        re-searched at full depth.
+  \item \textbf{Reverse futility / static null move}: at low depth, if the static
+        eval exceeds $\beta$ by $120\cdot d$, return early.
+  \item \textbf{Futility pruning}: at low depth, skip quiet moves when
+        $\text{static}+150\cdot d \le \alpha$.
+  \item \textbf{Late-move pruning (LMP)}: at very low depth, skip quiet moves
+        beyond a move-count threshold.
+  \item \textbf{Mate-distance pruning}: tighten the window using known mate
+        bounds so faster mates are preferred.
+  \item \textbf{Check extension}: search one ply deeper when in check.
+  \item \textbf{Internal iterative deepening (IID)}: at PV nodes lacking a TT
+        move, do a shallow search first to obtain a good first move.
+\end{itemize}
+
+\subsection{Iterative deepening, aspiration windows, time management}
+The driver searches depth $1,2,\dots$, reusing the previous depth's results
+(TT + PV) for ordering. From the previous score it opens a narrow
+\emph{aspiration window} ($\pm 50$); on a fail-high/low it widens exponentially
+and re-searches. Time is checked every 2048 nodes; the search aborts shortly
+before the per-move budget using a margin of $\min(300,\,\text{movetime}/25)$\,ms.
+A ``half-time'' rule avoids starting a new depth that almost certainly cannot
+finish. \textbf{The competition limit is a strict 2 seconds per move}; the engine
+adapts to whatever \code{movetime} the runner passes.
+
+% ==================================================================
+\section{NNUE: a neural evaluation trained from scratch}\label{sec:nnue}
+% ==================================================================
+No pre-trained weights or ML libraries were used; the entire pipeline is in C++.
+
+\subsection{Feature encoding (side-to-move relative)}
+The board is canonicalised to the side to move so the same weights serve both
+colours. White keeps orientation; \textbf{Black is rotated $180^\circ$}
+($r\!\to\!5{-}r,\ c\!\to\!4{-}c$), which is exact because Black's start array is
+White's rotated $180^\circ$. Each occupied square contributes one binary feature:
+\begin{equation}
+\text{feature} = \underbrace{\text{base}}_{0\ \text{own},\ 180\ \text{enemy}}
+ + (\text{piece}-1)\cdot 30 + \text{sq},\quad
+\text{sq}=\begin{cases} r\cdot5+c & \text{White}\\ (5{-}r)\cdot5+(4{-}c) & \text{Black}\end{cases}
+\end{equation}
+giving $2\times6\times30 = 360$ features (own/enemy $\times$ 6 piece types $\times$
+30 squares). The encoding is implemented identically in the trainer and the
+engine -- a mismatch would silently corrupt the evaluation.
+
+\subsection{Network and training pipeline}
+The shipped network is a small fully-connected net $360 \to 32 \to 1$ with ReLU
+and a $\tanh$ output (scaled by $600$ to centipawns). Training (\code{nnue\_train.cpp}):
+\begin{enumerate}[nosep]
+  \item \textbf{Self-play data}: $3000$ games are played (random openings of
+        $1$--$8$ plies plus $12\%$ random moves for diversity, otherwise a
+        depth-4 search picks moves), yielding $\approx 98\text{k}$ positions.
+  \item \textbf{Labels (WDL)}: every position is labelled with the eventual game
+        result from \emph{its} side-to-move's perspective ($+1$ win, $0$ draw,
+        $-1$ loss). Outcome labels carry information beyond the current eval,
+        which is the whole point.
+  \item \textbf{Training}: Adam, mini-batch MSE against the $\tanh$ output,
+        $60$ epochs (final MSE $\approx 0.56$).
+  \item \textbf{Embedding}: weights are written to \code{nnue\_weights.hpp} as
+        plain C++ arrays, so the engine is self-contained (no runtime model
+        file) and compiles with the standard command.
+\end{enumerate}
+
+\subsection{Inference: sparse, per-leaf, float}
+The board has $\le 20$ pieces, so the accumulator is rebuilt \emph{sparsely from
+scratch} at every leaf -- summing the $\le 20$ active feature rows of $W_1$ --
+rather than incrementally. This avoids make/unmake accumulator bugs and is cheap
+enough that NPS stays high ($\sim$1.4\,M nodes/s). Output:
+\begin{equation}
+\text{cp} = \mathrm{round}\Big(\tanh\big(b_2 + \textstyle\sum_h W_2[h]\cdot\mathrm{relu}(b_1[h]+\!\!\sum_{f\,\text{active}}\!\!W_1[f][h])\big)\cdot 600\Big).
+\end{equation}
+
+\subsection{Blend tuning}\label{sec:blend}
+We measured several blend ratios with \emph{diverse openings} (see
+Section~\ref{sec:method}). Pure NNUE ($b{=}100$) lost to a $b{=}50$ blend
+$0$/$8$; higher NNUE weight was monotonically worse ($b{=}70$ scored 25\% vs
+$b{=}50$). The chosen $b{=}30$ beats the pure hand-crafted engine
+\textbf{62.5\%} and the boss \textbf{87.5\%} (diverse openings), and sweeps the
+boss \textbf{8/8} from the fixed start at 2\,s.
+
+% ==================================================================
+\section{Architecture study: porting Stockfish NNUE (SFNNv1--v14)}
+% ==================================================================
+We investigated whether Stockfish's NNUE architecture evolution transfers to
+MiniChess. This section is the most likely demo discussion point.
+
+\subsection{What changed across SFNN versions}
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Version & Key architectural idea & Transfers to MiniChess? \\
+\midrule
+SFNNv1 & HalfKP features; \emph{two-perspective} accumulator; & dual-persp / clipped-ReLU: yes; \\
+       & clipped ReLU; deeper head; int quantization & HalfKP: too many features \\
+SFNNv4 & HalfKAv2 (king included as a piece) & partial (we include the king) \\
+SFNNv5 & HalfKAv2\_hm (horizontal mirroring) & no -- board is not L/R symmetric \\
+SFNNv6 & L1 width doubled; \emph{piece-count output buckets} & buckets: cheap, plausible \\
+v7--v14& L1 scaling $1024\!\to\!3072$, more data & scaling only \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Dual-perspective accumulator (SFNNv1 core)}
+We implemented the defining NNUE idea: encode the position from \emph{both} the
+side-to-move's and the opponent's viewpoint through a \emph{shared} feature
+transformer, concatenate the two accumulators, and pass through a deeper head
+($360 \to 64\,[\times2] \to 32 \to 1$) with clipped ReLU. Trained on pure WDL it
+reached a much lower MSE ($0.237$ vs $0.56$) -- yet it \textbf{played worse}: the
+two accumulators plus the bigger head cut NPS $\sim$3$\times$
+($1.26\text{M}\to350\text{k}$), costing $\sim$1.5--2 plies of depth. Result:
+25\% vs hand-crafted, 80\% vs boss (down from 62.5\%/87.5\%).
+
+\subsection{int16 quantization (auto-vectorized)}
+To recover the lost speed we quantized to int16 (SFNNv1's speed trick): weights
+scaled by $Q_A{=}512$ (clipped-ReLU unit) and $Q_W{=}256$ (layer weights), with
+\emph{int32} accumulation laid out contiguously so the compiler auto-vectorizes
+under \code{-march=native} (float-vs-int parity $\approx$2.5\,cp). This raised the
+dual-perspective net to 502\,k\,nps and 45\%/85\% -- a clear recovery, but
+\emph{still below} the simple single-perspective net. Quantizing the
+single-perspective net instead gave \emph{no} speedup (its float eval is already
+cheap and int16 widening cancels the lane-count gain) and the clipped-ReLU
+retraining slightly regressed it (47.5\% vs hand).
+
+\subsection{Conclusion of the study}
+\textbf{Stockfish's NNUE architecture is sound but does not transfer to
+MiniChess.} On full chess, NNUE's eval cost is amortised by enormous search
+trees, the hand-crafted alternative is far weaker, and int8 SIMD + incremental
+updates keep NNUE cheap. On a $6\times5$ board none of that holds: a cheap eval
+plus more search depth wins, so the structural sophistication (and even its
+quantization speed trick) is a net loss. The shipped engine therefore uses the
+\emph{single-perspective float} net. (All experiments are preserved on git
+branches as documented negative results.)
+
+% ==================================================================
+\section{Search-speed optimization: a ply-indexed node pool}
+% ==================================================================
+Profiling pointed at per-node memory churn: the search did \code{new
+State}+\code{delete} (and a fresh move-list allocation) for every node. We added
+\code{State::apply\_into} / \code{null\_into}, which write the child position
+\emph{in place} into a caller-owned \code{State} taken from a ply-indexed pool
+(\code{g\_node\_pool}), reusing each slot's move-list buffer. Depth-first search
+guarantees \code{pool[child\_ply]} is free to overwrite once a subtree returns,
+and a parent never reads a child slot while recursing -- so the search tree is
+\emph{provably identical} (verified: same node counts and scores) while two heap
+allocations per node disappear. Net effect: \textbf{$\sim$12\% higher NPS
+($1.26\text{M}\to1.41\text{M}$)}, validated at 10/12 vs the boss. This is the one
+optimization (of the three attempted) that shipped.
+
+% ==================================================================
+\section{Negative results (also useful at the demo)}
+% ==================================================================
+\begin{itemize}[nosep]
+  \item \textbf{Texel-tuning the material values} to fit WDL improved the static
+        loss by only $0.4\%$ and \emph{lost 37.5\%} head-to-head: static-eval
+        loss is a poor proxy for strength, and material values also drive move
+        ordering / delta pruning, so reweighting hurt search efficiency.
+  \item \textbf{Opening book}: with a strict \emph{per-move} 2\,s limit (no game
+        clock) a book cannot bank time and the engine already plays the fixed
+        opening optimally, so a book would only echo the engine's own move. Not
+        shipped (it would be a no-op).
+  \item \textbf{Search-score teacher for NNUE} (labelling positions with the
+        engine's own deep-search score instead of game outcome) reached a very
+        low MSE but regressed in play -- the net merely learned to imitate the
+        existing eval.
+\end{itemize}
+
+% ==================================================================
+\section{Results and methodology}\label{sec:method}
+% ==================================================================
+\paragraph{Measuring strength correctly.} Games from the fixed start position are
+nearly deterministic (only timing jitter varies), so a ``20-game match'' is
+effectively one game repeated and cannot resolve small differences. We therefore
+added \emph{random openings} (\code{--opening-plies N --seed S}) to the match
+runner; all comparative numbers below use diverse openings.
+
+\begin{table}[h]\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Opponent & Result (final engine) & Notes \\
+\midrule
+Weak MiniMax (baseline)   & 4/4    & both colours \\
+Strong MiniMax (baseline) & 4/4    & both colours \\
+Alpha-Beta (baseline)     & win    & weaker than the PVS boss we beat 8/8 \\
+PVS (visible boss)        & 8/8    & 2\,s, fixed start \\
+PVS boss, diverse openings& 87.5\% & 20 games, harder test \\
+Hand-crafted-only engine  & 62.5\% & isolates the NNUE blend's value \\
+\bottomrule
+\end{tabular}
+\caption{Final engine (single-perspective NNUE blend, node pool) vs.\ opponents.}
+\end{table}
+
+\paragraph{Constraints respected.} Standard library only (NNUE weights are
+embedded C++ arrays); no manual SIMD/inline-asm (only compiler auto-vectorization
+via \code{-march=native}); the engine's policy code is single-threaded;
+TT $\approx$48\,MB, well under the 4\,GB limit.
+
+% ==================================================================
+\section{Key points to remember for the demo}
+% ==================================================================
+\begin{enumerate}[nosep]
+  \item \textbf{Search}: negamax + alpha-beta + PVS + quiescence, plus TT,
+        killer/counter/history ordering, IID, aspiration windows, NMP, LMR,
+        reverse-futility/futility/late-move pruning, mate-distance pruning, and
+        check extensions. Be ready to explain \emph{why} each prunes safely.
+  \item \textbf{Evaluation}: material + PST + king tropism + pawn structure +
+        passed pawns + mobility, \emph{blended} with a from-scratch NNUE at 30\%.
+  \item \textbf{NNUE}: 360-feature side-to-move-relative encoding ($180^\circ$
+        flip for Black), $360\!\to\!32\!\to\!1$, trained by C++ self-play on WDL
+        labels, weights embedded in a header, sparse per-leaf inference.
+  \item \textbf{Headline insight}: \emph{on a small board, depth beats eval
+        sophistication}; SOTA chess NNUE architecture and its quantization trick
+        do \emph{not} transfer (measured, not assumed).
+  \item \textbf{Second insight}: \emph{lower training loss $\ne$ stronger play}
+        -- shown three times (score-teacher NNUE, dual-perspective NNUE, texel
+        tuning).
+  \item \textbf{Methodology}: use random openings to measure strength; a clean
+        speedup (node pool) must be a provable non-regression (identical node
+        counts) before shipping.
+\end{enumerate}
+
+\paragraph{Build.}
+\begin{lstlisting}[language=bash]
+g++ --std=c++2a -Wall -Wextra -Wpedantic -g -O3 -march=native -static \
+  -Isrc/games/minichess -Isrc/state -Isrc \
+  -o build/minichess-ubgi.exe \
+  src/games/minichess/state.cpp src/policy/minimax.cpp \
+  src/policy/random.cpp src/policy/submission.cpp src/ubgi/ubgi.cpp
+\end{lstlisting}
+NNUE is on by default and self-contained; \code{-DNO\_NNUE} disables it and
+\code{-DNNUE\_BLEND=$n$} changes the mix.
+
+\end{document}
