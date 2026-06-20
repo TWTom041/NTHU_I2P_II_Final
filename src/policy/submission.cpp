@@ -13,14 +13,15 @@
  * default and self-contained -- the standard build command activates it with
  * no extra flags. Compile with -DNO_NNUE to disable, or -DNNUE_BLEND=<0..100>
  * to override the mix (percentage weight given to the NNUE score; the
- * remainder goes to the hand-crafted eval). Tuned default: 30. */
+ * remainder goes to the hand-crafted eval). Tuned default: 45 (the net is
+ * trained on ~930k self-play positions; tools/nnue_gen.cpp + tools/train_nnue.py). */
 #ifndef NO_NNUE
 #define USE_NNUE
 #endif
 #ifdef USE_NNUE
 #include "nnue.hpp"
 #ifndef NNUE_BLEND
-#define NNUE_BLEND 30
+#define NNUE_BLEND 45
 #endif
 #endif
 

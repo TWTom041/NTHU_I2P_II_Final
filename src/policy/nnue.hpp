@@ -2,11 +2,12 @@
 /* ================================================================
  * NNUE evaluation for MiniChess (6x5).
  *
- * Small fully-connected net  360 -> HIDDEN -> 1  with a tanh output,
- * trained on self-play WDL data by tools/nnue_train.cpp. Weights are
- * embedded in nnue_weights.hpp.
+ * Fully-connected net  360 -> HIDDEN -> 1  with a ReLU hidden layer and a
+ * tanh output, trained on GPU (tools/train_nnue.py) from self-play data
+ * (tools/nnue_gen.cpp) on a blend of game result (WDL) and teacher search
+ * score. Weights are embedded in nnue_weights.hpp.
  *
- * Feature encoding MUST stay identical to tools/nnue_train.cpp:
+ * Feature encoding MUST stay identical to tools/nnue_gen.cpp:
  *   Board is canonicalised to the side-to-move's perspective. White (stm 0)
  *   keeps orientation; Black (stm 1) is rotated 180 deg (r->5-r, c->4-c).
  *   feature = base + (piece-1)*30 + sq      (piece in 1..6)
@@ -31,7 +32,7 @@ inline int persp_sq(int r, int c, int stm){
 /* Evaluate from the side-to-move's perspective, in centipawn-like units. */
 inline int evaluate(const State* s){
     const int H = nnue_data::HIDDEN;
-    float acc[64];
+    float acc[512];   // upper bound on HIDDEN; net is single-hidden 360->H->1
     for(int h = 0; h < H; h++) acc[h] = nnue_data::B1[h];
 
     const int stm = s->player;
